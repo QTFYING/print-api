@@ -1,0 +1,38 @@
+# ============================================================
+# 云效 Flow 流水线③（api 仓）—— 步骤草稿
+# 正式流水线在云效控制台创建，本文件作为步骤基准；schema 以云效校验为准。
+# 门禁（plans/05 §3.1 契约铁律 + §4.1 性能门禁）：
+#   1. lint/typecheck 全绿
+#   2. openapi.json 契约快照 diff=0（变更必须与代码同 commit 提交）
+#   3. prisma migrate deploy 先于服务滚动；健康检查 /api/v1/health
+# ============================================================
+name: pte-api-deploy
+trigger:
+  branches:
+    include: [master]
+stages:
+  - name: check
+    steps:
+      - name: lint-and-typecheck
+        script: |
+          corepack enable && pnpm install --frozen-lockfile
+          pnpm lint && pnpm typecheck
+      - name: openapi-contract-gate
+        script: |
+          pnpm openapi:export
+          git diff --exit-code -- openapi.json || (echo "契约快照未同步：请运行 pnpm openapi:export 并随代码提交" && exit 1)
+  - name: build
+    steps:
+      - name: docker-build-push
+        script: |
+          docker build -f scripts/deploy/Dockerfile -t $ACR_REGISTRY/pte-server:$CI_COMMIT_ID .
+          docker push $ACR_REGISTRY/pte-server:$CI_COMMIT_ID
+  - name: deploy
+    steps:
+      - name: ecs-pull-and-migrate
+        script: |
+          REGISTRY=$ACR_REGISTRY TAG=$CI_COMMIT_ID docker compose -f scripts/deploy/docker-compose.prod.yml pull
+          docker compose -f scripts/deploy/docker-compose.prod.yml run --rm server pnpm prisma migrate deploy
+          REGISTRY=$ACR_REGISTRY TAG=$CI_COMMIT_ID docker compose -f scripts/deploy/docker-compose.prod.yml up -d
+      - name: smoke-health
+        script: curl -fsS http://127.0.0.1:4000/api/v1/health

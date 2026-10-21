@@ -1,0 +1,1899 @@
+// ============================================================
+// pte_platform —— 8 域重建模（plans/05 §6，PostgreSQL 16 目标 / 开发库 myserver PG18）
+// 原则：
+//  1) 不照搬旧表：88 张生效表 → 8 域语义模型；旧列名以 /// 注释保留，供 ETL 映射与对账回查。
+//  2) 存疑列不跳过（§6.3 零数据丢失）：legacy_extra JSONB，确认前按内容可检索（GIN 索引见后续迁移）。
+//  3) 隐式状态机全部显式化（§6.2）：stage / booth_change_status / receivable_lock / approval_*。
+//  4) 届次 scope 强制（§6.3 D3 根治）：业务表 show_id NOT NULL + 复合唯一键 (show_id, booth_no)。
+//  5) 金额一律 NUMERIC(12,2)（取代带千分位逗号字符串存库）；币种+汇率快照进财务域（v2.0 补）。
+//  6) 只用 PG16/18 通用特性（JSONB/GIN/物化视图），不引入 PG18 独有语法（AGENTS.md 铁律 2 备注）。
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==================== 枚举（显式化取代隐式位）====================
+
+/// exhibitors end01~end08 流程位 → 单一状态机（§6.2）
+enum ExhibitorStage {
+  SUBMITTED // end01 申请表已提交
+  APPROVED // end02 申请成功
+  BOOTH_ASSIGNED // end03 展位已分配
+  BOOTH_CONFIRMED // end04 展位已确定
+  CONTRACT_GENERATED // end05 合同已生成
+  CONTRACT_SIGNED // end06 合同已签订
+  DEPOSIT_PAID // end07 定金支付
+  BALANCE_PAID // end08 余款支付
+  CANCELLED // iscancel / 作废旁路
+}
+
+/// group_leader 1确定/2请求更换/3取消/4审核通过 → 显式枚举
+enum BoothChangeRequest {
+  CONFIRMED // 1
+  REQUEST_CHANGE // 2
+  CANCELLED // 3
+  APPROVED // 4
+}
+
+/// exhibitors016 展台类型
+enum BoothType {
+  RAW_SPACE // 光地展位
+  STANDARD // 标准展位
+  ADVERTISEMENT // 广告
+}
+
+/// exhibitors_online 在线池(1)/管理池(0)
+enum RecordPool {
+  ONLINE // 在线注册未确认/被退回
+  MANAGED // 已入后台管理池
+}
+
+/// exhibitor_stage_log 置位来源（谁改的不再无人知晓）
+enum StageChangeSource {
+  MANUAL
+  CONTRACT_GENERATED // 生成合同 docx ⇒ 自动进 CONTRACT_GENERATED（唯一自动置位点，保留）
+  FINANCE_CASCADE // 财务勾选合同已签 ⇒ 级联补置前置阶段（保留）
+  CONTRACT_VOID // 删除/作废合同触发回退（旧系统缺陷：不清 end05，新系统修复并记 log）
+  MIGRATION // ETL 还原
+}
+
+/// 制单单位 ZDRDW_Type / 收款单位 SKDW_Type 1-4（approval_flow_def 16 组合）
+enum AssocUnitType {
+  DONGGUAN_ZHONGYIN // 1 东莞中印协
+  BEIJING_HUAGANG // 2 北京华港
+  CHINA_PRINTING // 3 中国印协
+  GUANGDONG_PRINTING // 4 广东印协
+}
+
+enum ApprovalNodeStatus {
+  PENDING // status 0
+  APPROVED // status 1
+  REJECTED // status 2
+}
+
+enum ApprovalInstanceStatus {
+  IN_PROGRESS
+  APPROVED
+  REJECTED
+  WITHDRAWN
+  VOIDED
+}
+
+enum ApprovalAction {
+  SUBMIT
+  APPROVE
+  REJECT
+  REASSIGN
+  WITHDRAW
+  VOID
+  GENERATE_SHEET
+}
+
+enum ContractStatus {
+  DRAFT
+  GENERATED // 已生成 docx
+  SIGNED // 已签订
+  VOIDED // 作废（软删，触发 stage 回退）
+}
+
+enum DiscountKind {
+  ASSOCIATION // JGYYH_Type 1-6 协会折扣 20%/10%
+  TIME_LIMIT // JG_DJYH_Type 1-4 时限折扣
+}
+
+enum PaymentChannel {
+  BANK_TRANSFER // 对公转账
+  ONLINE_WECHAT // 线上收款（通道/商户主体待甲方裁决 §11-8）
+  CASH
+  CHEQUE
+  OTHER
+}
+
+enum LockBlock {
+  INFO // lock1
+  INVOICE // lock2
+  BOOTH_FEE // lock3
+  DEPOSIT // lock4
+  BALANCE // lock5
+  REFUND // lock6（原 lock31 内含）
+  PENALTY // lock7（原 lock31 内含）
+  OTHER // lock8（原 lock_a 内含）
+}
+
+enum LockStatus {
+  LOCKED
+  UNLOCKED
+}
+
+enum InvoiceKind {
+  VAT_SPECIAL
+  VAT_GENERAL
+  RECEIPT
+}
+
+enum InvoiceStatus {
+  ISSUED
+  VERIFIED
+  VOIDED
+  RETURNED
+}
+
+enum FlowbackStatus {
+  NOT_SENT
+  SENT
+  FAILED
+  SKIPPED
+}
+
+enum TicketKind {
+  EARLY_BIRD // 早鸟（投标版 A 档已含票价）
+  FULL_PRICE // 全价
+  GROUP
+  INVITATION
+  STAFF
+}
+
+enum RegistrationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+  CHECKED_IN // 现场核销
+}
+
+/// 观众来源：新老双源 + 微网站/门户合并（阶段4「统一数据」非仅迁数据）
+enum VisitorSource {
+  LEGACY_PC // expo_visitor_online
+  LEGACY_MICROSITE // wwz_visitor_register / wwz_conference_register
+  PORTAL_PREREG // 新预登记
+  CIEC // 外部 CIEC 平台回流（是否切断待甲方裁决 §11-6）
+  MEMBER_SELF
+  ONSITE_SCAN
+}
+
+enum ETicketStatus {
+  ISSUED
+  USED
+  INVALID
+  LOST
+}
+
+enum MemberKind {
+  VISITOR
+  EXHIBITOR
+  STAFF
+}
+
+enum PasswordAlgorithm {
+  LEGACY_MD5 // 无盐 MD5 过渡兼容（itma_pas，首登强制改密）
+  BCRYPT
+  ARGON2ID
+}
+
+enum SmsChannel {
+  SMS
+  VOICE // 国际三兜底
+  QRCODE
+}
+
+enum SmsScene {
+  VISITOR_REGISTER
+  EXHIBITOR_LOGIN
+  EXHIBITOR_REGISTER
+  PASSWORD_RESET
+  TICKET_CHECKIN
+}
+
+enum ExportJobStatus {
+  QUEUED
+  RUNNING
+  SUCCESS
+  FAILED
+  PURGED
+}
+
+enum TranslationStatus {
+  SOURCE_FINAL
+  MACHINE_DRAFT
+  HUMAN_REVIEWED
+  PUBLISHED
+}
+
+enum ContentLang {
+  zh
+  en
+}
+
+enum SnapshotType {
+  PREVIOUS_EDITION // expo_exhibitors_previous
+  IMPORT_STAGING // expo_exhibitors_import_data_pre
+  ITMA // expo_exhibitors_itma
+  ONLINE_POOL // expo_exhibitors_online 侧快照
+}
+
+enum AuditTargetKind {
+  EXHIBITOR
+  CONTRACT
+  APPROVAL
+  PAYMENT
+  INVOICE
+  LOCK
+  ORDER
+  VISITOR
+  MEMBER
+  CONTENT
+  FILE
+  SYSTEM
+}
+
+enum SqlKind {
+  INSERT
+  UPDATE
+  DELETE
+}
+
+// ==================== 1. 届次域 ====================
+
+/// 取代 expo_show（show001 编号 / show002 名称；展馆横排列 show008~show017_10 下沉到 ShowHall）
+model Show {
+  id           String    @id @default(uuid(7))
+  code         String    @unique /// show001 届次编号（如 2027），合同编号前缀
+  nameCn       String    @map("name_cn") /// show002
+  nameEn       String?   @map("name_en")
+  startOn      DateTime? @map("start_on") @db.Date
+  endOn        DateTime? @map("end_on") @db.Date
+  venueName    String?   @map("venue_name")
+  venueAddress String?   @map("venue_address")
+  isCurrent    Boolean   @default(false) @map("is_current") /// 登录默认选届
+  remarks      String? /// add_remarks
+  distribution Json?     @db.JsonB /// distribution 派位配置（语义存疑原样保）
+  legacyExtra  Json?     @map("legacy_extra") @db.JsonB
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  halls          ShowHall[]
+  bankAccounts   BankAccount[]
+  exhibitors     Exhibitor[]
+  contracts      Contract[]
+  registrations  VisitorRegistration[]
+  orders         OrderItem[]
+  siteOrders     SiteOrder[]
+  events         EventActivity[]
+  visitHistories VisitorVisitHistory[]
+  snapshots      ExhibitorVariant[]
+
+  @@map("show")
+
+  // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
+  @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@index([distribution(ops: raw("jsonb_path_ops"))], type: Gin)
+}
+
+/// 取代 show008~show017_10 横排列 + expo_exhibits_partition（展馆分区）
+model ShowHall {
+  id           String  @id @default(uuid(7))
+  showId       String  @map("show_id")
+  show         Show    @relation(fields: [showId], references: [id])
+  hallNo       String  @map("hall_no") /// 展馆号（A/B/C…）
+  nameCn       String  @map("name_cn")
+  nameEn       String? @map("name_en")
+  priceZone    String? @map("price_zone") /// JGQY 价区 A/B/C（2200/1700/1300）
+  floorPlanUrl String? @map("floor_plan_url") /// show0XX_pic 展位图（迁 OSS 私有桶后为 objectKey）
+  remark       String? /// bz
+  sortOrder    Int     @default(0) @map("sort_order") /// xuhao
+  active       Boolean @default(true)
+
+  exhibitors  Exhibitor[]
+  intentionOf Exhibitor[]      @relation("IntentionHall")
+  booths      ExhibitorBooth[]
+  orderItems  OrderItem[]
+  dataScopes  DataScope[]
+
+  @@unique([showId, hallNo])
+  @@index([showId, sortOrder])
+  @@map("show_hall")
+}
+
+/// 取代 expo_bank（届次 s_bankid 指向）
+model BankAccount {
+  id          String  @id @default(uuid(7))
+  showId      String? @map("show_id")
+  show        Show?   @relation(fields: [showId], references: [id])
+  label       String
+  bankName    String  @map("bank_name")
+  accountNo   String  @map("account_no")
+  accountName String? @map("account_name")
+  currency    String  @default("CNY")
+  isDefault   Boolean @default(false) @map("is_default")
+  active      Boolean @default(true)
+
+  payments PaymentRecord[]
+  deposits BankDeposit[]
+
+  @@map("bank_account")
+}
+
+/// 取代 expo_party_info：甲方主体 + 收款账户 + 双 Word 模板路径
+model OrganizerParty {
+  id               String         @id @default(uuid(7))
+  unitType         AssocUnitType? @map("unit_type") /// 与审批制单/收款单位类型对齐
+  nameCn           String         @map("name_cn")
+  nameEn           String?        @map("name_en")
+  contactPerson    String?        @map("contact_person")
+  contactPhone     String?        @map("contact_phone")
+  address          String?
+  bankName         String?        @map("bank_name")
+  bankAccountNo    String?        @map("bank_account_no")
+  taxNo            String?        @map("tax_no")
+  templateDeposit  String?        @map("template_deposit") /// dj_path 定金协议模板（objectKey）
+  templateContract String?        @map("template_contract") /// ht_path 合同模板（objectKey）
+  active           Boolean        @default(true)
+
+  contracts Contract[]
+
+  @@map("organizer_party")
+}
+
+/// 折扣条款收敛：JGYYH_Type 1-6 + JG_DJYH_Type 1-4 两处重复硬编码 → 单表共读（§6.2）
+model PricingRule {
+  id          String         @id @default(uuid(7))
+  code        String         @unique
+  kind        DiscountKind
+  unitType    AssocUnitType? @map("unit_type") /// 协会类折扣适用主体
+  rate        Decimal        @db.Decimal(6, 4) /// 0.20 = 20%
+  labelCn     String         @map("label_cn")
+  validFrom   DateTime?      @map("valid_from") @db.Date
+  validTo     DateTime?      @map("valid_to") @db.Date
+  priority    Int            @default(0)
+  active      Boolean        @default(true)
+  description String?
+
+  contracts Contract[]
+
+  @@map("pricing_rule")
+}
+
+// ==================== 2. 展商域 ====================
+
+/// 取代 expo_exhibitors（编号式列名 → 语义列，依据 docs/数据库表结构汇总.md §B 高置信映射）
+model Exhibitor {
+  id     String @id @default(uuid(7))
+  showId String @map("show_id")
+  show   Show   @relation(fields: [showId], references: [id])
+
+  companyNameCn     String? @map("company_name_cn") /// exhibitors002 中文全称（空时自动取英文）
+  companyNameCnAbbr String? @map("company_name_cn_abbr") /// 002_1 中文简称
+  companyNameEn     String? @map("company_name_en") /// 003 英文全称
+  companyNameEnAbbr String? @map("company_name_en_abbr") /// 003_1 英文简称
+  searchPinYin      String? @map("search_pin_yin") /// 名录拼音检索列（B 档复合筛选用）
+  searchKeywords    String[]    @default([]) @map("search_keywords") /// 实测新增：旧表 keywords 列（3686/3693 行有值、2629 个不同值），B 档名录检索直接依赖，§B 文档未记录
+
+  provinceCode  String? @map("province_code") /// 004 存 PROVINCE_CODE
+  cityCode      String? @map("city_code") /// bs_city 同名列
+  districtCode  String? @map("district_code") /// bs_area 同名列
+  addressCn     String? @map("address_cn") /// 005
+  addressEn     String? @map("address_en") /// 006
+  postcode      String? /// 007
+  website       String? /// 008
+  countryRegion String? @map("country_region") /// 016_4 国家/地区文本
+
+  contactNameCn String? @map("contact_name_cn") /// 009
+  contactNameEn String? @map("contact_name_en") /// 010
+  contactTitle  String? @map("contact_title") /// 011 联系人职务
+  phone         String? /// 012
+  fax           String? /// 013
+  mobile        String? /// 014 登录辅助凭据
+  loginEmail    String? @map("login_email") /// 015 展商端登录账号
+
+  boothType         BoothType? @map("booth_type") /// 016
+  boothLengthM      Decimal?   @map("booth_length_m") @db.Decimal(8, 2) /// 016_1
+  boothWidthM       Decimal?   @map("booth_width_m") @db.Decimal(8, 2) /// 016_2
+  boothOpeningFaces Int?       @map("booth_opening_faces") /// 016_3 开口面 1~4
+  priceZone         String?    @map("price_zone") /// 016_6 展位区域 A/B/C
+  hallId            String?    @map("hall_id") /// 017 展馆名 → FK（D 文档误记"展位号"，以编辑页标签=展馆为准）
+  hall              ShowHall?  @relation(fields: [hallId], references: [id])
+  intentionHallId   String?    @map("intention_hall_id") /// yxzg_id 意向展馆 → expo_exhibits_partition
+  intentionHall     ShowHall?  @relation("IntentionHall", fields: [intentionHallId], references: [id])
+  boothNo           String?    @map("booth_no") /// 018 展位号（同届次唯一查重键）
+  areaSqm           Decimal?   @map("area_sqm") @db.Decimal(10, 2) /// 020 = 016_1×016_2
+  boothFee          Decimal?   @map("booth_fee") @db.Decimal(12, 2) /// 020_1 展位费
+
+  categoryBigId   String?          @map("category_big_id") /// 021 展品类别大类
+  categorySmallId String?          @map("category_small_id") /// 022 展品类别小类
+  categoryBig     ProductCategory? @relation("ExhibitorBigCat", fields: [categoryBigId], references: [id])
+  categorySmall   ProductCategory? @relation("ExhibitorSmallCat", fields: [categorySmallId], references: [id])
+
+  profileCn          String? @map("profile_cn") /// 023 企业简介中
+  profileEn          String? @map("profile_en") /// 024 企业简介英
+  salesperson        String? /// 026 业务员
+  companyNature      String? @map("company_nature") /// 029 内资/外资/合资/国企
+  companyType        String? @map("company_type") /// 030 Company_category 1~5
+  legalPersonName    String? @map("legal_person_name") /// 031 法人
+  generalManagerName String? @map("general_manager_name") /// 032 总经理
+  registeredAddress  String? @map("registered_address") /// 033
+  officeAddress      String? @map("office_address") /// 034
+  brand              String?
+  fasciaCn           String? @map("fascia_cn") /// 楣板字中
+  fasciaEn           String? @map("fascia_en") /// 楣板字英
+  groupNo            String? @map("group_no") /// ztbh 组团号（三位）
+  remarks            String? /// 备注/参展意向
+
+  /// ---- 状态位显式化 ----
+  stage              ExhibitorStage      @default(SUBMITTED)
+  boothRequest       BoothChangeRequest? @default(CONFIRMED) @map("booth_request")
+  isCancelled        Boolean             @default(false) @map("is_cancelled") /// iscancel=1 拒登+标红（1:1 复刻肌肉记忆）
+  recordPool         RecordPool          @default(ONLINE) @map("record_pool") /// exhibitors_online
+  mustChangePassword Boolean             @default(true) @map("must_change_password") /// 旧 itma_pas MD5 迁移后首登强制改密（§7）
+
+  /// ---- 里程碑时间戳（end 位对应的业务时间）----
+  applicationSubmittedAt DateTime? @map("application_submitted_at") /// applicationdate
+  contractSignedAt       DateTime? @map("contract_signed_at") /// contract_date
+  depositPaidAt          DateTime? @map("deposit_paid_at") /// payment1_date
+  depositPaidAmount      Decimal?  @map("deposit_paid_amount") @db.Decimal(12, 2) /// payment1_amount
+  balancePaidAt          DateTime? @map("balance_paid_at") /// payment2_date
+  balancePaidAmount      Decimal?  @map("balance_paid_amount") @db.Decimal(12, 2) /// payment2_amount
+
+  legacyExtra Json? @map("legacy_extra") @db.JsonB /// §6.3 存疑列原样保：015_6/016_5/016_a/016_b/019/024_1/024_3/028/033_1/033_2/recycle/email_send
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at") /// 软删（取代泛化删除接口 S3 对策）
+
+  stageLogs      ExhibitorStageLog[]
+  booths         ExhibitorBooth[]
+  dues           ExhibitorDues[]
+  contactLogs    ExhibitorContactLog[]
+  qualifications ExhibitorQualification[]
+  variants       ExhibitorVariant[]
+  contracts      Contract[]
+  payments       PaymentRecord[]
+  invoices       Invoice[]
+  refundDeposits RefundDeposit[]
+  orders         OrderItem[]
+  siteOrders     SiteOrder[]
+  products       ProductItem[]
+  yearbook       YearbookInfo?
+  badges         Badge[]
+  invitations    Invitation[]
+  feeRequests    BillingRequest[]
+  activities     EventActivity[]
+  identities     MemberIdentity[]
+  locks          ReceivableLock[]
+
+  @@index([showId, boothNo]) /// 唯一性由部分唯一索引落地：WHERE booth_no IS NOT NULL（见迁移 2_gin_and_partial_unique）
+  @@index([showId, stage])
+  @@index([showId, companyNameCn])
+  @@index([loginEmail])
+  @@index([mobile])
+  @@map("exhibitor")
+
+  // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
+  @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@index([companyNameCn(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([companyNameEn(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([searchPinYin(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([searchKeywords(ops: raw("array_ops"))], type: Gin, map: "exhibitor_search_keywords_gin")
+}
+
+/// 取代静默状态位：每次跃迁记 actor/time/reason（§6.2）
+model ExhibitorStageLog {
+  id          String            @id @default(uuid(7))
+  exhibitorId String            @map("exhibitor_id")
+  exhibitor   Exhibitor         @relation(fields: [exhibitorId], references: [id])
+  fromStage   ExhibitorStage?   @map("from_stage")
+  toStage     ExhibitorStage    @map("to_stage")
+  source      StageChangeSource @default(MANUAL)
+  actorId     String?           @map("actor_id") /// → Member（员工/展商自助）；MIGRATION 时为空
+  actor       Member?           @relation("StageLogActor", fields: [actorId], references: [id])
+  reason      String?
+  occurredAt  DateTime          @default(now()) @map("occurred_at")
+
+  @@index([exhibitorId, occurredAt])
+  @@map("exhibitor_stage_log")
+}
+
+/// 取代 expo_exhibitors_fenpeizw（展位分配明细；批量重建由 SP 改 TS 事务内 upsert）
+model ExhibitorBooth {
+  id            String    @id @default(uuid(7))
+  exhibitorId   String    @map("exhibitor_id")
+  exhibitor     Exhibitor @relation(fields: [exhibitorId], references: [id])
+  hallId        String?   @map("hall_id")
+  hall          ShowHall? @relation(fields: [hallId], references: [id])
+  boothNo       String    @map("booth_no")
+  rentAmount    Decimal?  @map("rent_amount") @db.Decimal(12, 2) /// ZWZJ 租金
+  depositAmount Decimal?  @map("deposit_amount") @db.Decimal(12, 2) /// ZWDJ 定金
+  balanceAmount Decimal?  @map("balance_amount") @db.Decimal(12, 2) /// ZWYK 余款
+  discountRate  Decimal?  @map("discount_rate") @db.Decimal(6, 4)
+  areaSqm       Decimal?  @map("area_sqm") @db.Decimal(10, 2)
+  sortOrder     Int       @default(0) @map("sort_order")
+  active        Boolean   @default(true)
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  approvals ApprovalInstance[]
+
+  @@index([hallId, boothNo]) /// 部分唯一索引：WHERE hall_id IS NOT NULL
+  @@index([exhibitorId])
+  @@map("exhibitor_booth")
+}
+
+/// dues01~25 横排列 → 期次行式化（取代 expo_exhibitors_dues）
+model ExhibitorDues {
+  id             String    @id @default(uuid(7))
+  exhibitorId    String    @map("exhibitor_id")
+  exhibitor      Exhibitor @relation(fields: [exhibitorId], references: [id])
+  periodCode     String    @map("period_code") /// dj_bffk/dj_qbfk/wk_bffk/wk_qbfk/dj_wfk/yk_wfk/wfk …
+  periodIndex    Int       @map("period_index")
+  itemLabel      String?   @map("item_label")
+  amountDue      Decimal   @default(0) @map("amount_due") @db.Decimal(12, 2)
+  amountPaid     Decimal   @default(0) @map("amount_paid") @db.Decimal(12, 2)
+  amountInvoiced Decimal   @default(0) @map("amount_invoiced") @db.Decimal(12, 2)
+  dueOn          DateTime? @map("due_on") @db.Date
+  remark         String?
+  legacyExtra    Json?     @map("legacy_extra") @db.JsonB
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  payments PaymentRecord[]
+
+  @@unique([exhibitorId, periodCode])
+  @@index([exhibitorId])
+  @@map("exhibitor_dues")
+
+  // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
+  @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
+}
+
+/// 取代 expo_exhibitors_connect（沟通记录）
+model ExhibitorContactLog {
+  id          String    @id @default(uuid(7))
+  exhibitorId String    @map("exhibitor_id")
+  exhibitor   Exhibitor @relation(fields: [exhibitorId], references: [id])
+  authorId    String?   @map("author_id") /// 旧 sysuser_id → expo_admin
+  author      Member?   @relation("ExhibitorContactAuthor", fields: [authorId], references: [id])
+  content     String
+  occurredAt  DateTime  @default(now()) @map("occurred_at")
+
+  @@index([exhibitorId, occurredAt])
+  @@map("exhibitor_contact_log")
+}
+
+/// itma01~06 资质位 → 布尔 + 附件（取代 expo_exhibitors 上的散列 itma* 列）
+model ExhibitorQualification {
+  id                     String    @id @default(uuid(7))
+  exhibitorId            String    @unique @map("exhibitor_id")
+  exhibitor              Exhibitor @relation(fields: [exhibitorId], references: [id])
+  isChinaPrintingMember  Boolean   @default(false) @map("is_china_printing_member") /// itma01
+  isListedCompany        Boolean   @default(false) @map("is_listed_company") /// itma02
+  listedCountry          String?   @map("listed_country") /// itma02_1
+  listedCity             String?   @map("listed_city")
+  stockCode              String?   @map("stock_code") /// itma02_2
+  isGuangdongPrintMember Boolean   @default(false) @map("is_guangdong_print_member") /// itma03
+  isWenzhouPrintMember   Boolean   @default(false) @map("is_wenzhou_print_member") /// itma04
+  isSpecializedNovel     Boolean   @default(false) @map("is_specialized_novel") /// itma05 专精特新
+  specializedType        Int?      @map("specialized_type") /// itma06 0~3
+  specializedLevel       String?   @map("specialized_level") /// itma06_1
+  certObjectKey          String?   @map("cert_object_key") /// itma06_file_oname/_sname 证书附件 → OSS
+  certUploadedAt         DateTime? @map("cert_uploaded_at") /// itma06__uptime
+  updatedAt              DateTime  @updatedAt @map("updated_at")
+
+  @@map("exhibitor_qualification")
+}
+
+/// 历届三套源统一（§6.1：pre/previous/online + ITMA 收编为一个 snapshotType）
+model ExhibitorVariant {
+  id           String       @id @default(uuid(7))
+  showId       String?      @map("show_id")
+  show         Show?        @relation(fields: [showId], references: [id])
+  exhibitorId  String?      @map("exhibitor_id")
+  exhibitor    Exhibitor?   @relation(fields: [exhibitorId], references: [id])
+  snapshotType SnapshotType @map("snapshot_type")
+  sourceTable  String       @map("source_table") /// 旧表名，对账回查用
+  externalRef  String?      @map("external_ref") /// 旧 id
+  companyName  String?      @map("company_name") /// 归并匹配用（旧系统拿公司名当主键是教训）
+  payload      Json         @db.JsonB /// 原始列快照，零数据丢失
+  mergedIntoId String?      @map("merged_into_id") /// 归并到哪个展商（历届展商归并，阶段4）
+  ingestedAt   DateTime     @default(now()) @map("ingested_at")
+
+  @@index([snapshotType, companyName])
+  @@index([mergedIntoId])
+  @@map("exhibitor_variant")
+
+  // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
+  @@index([payload(ops: raw("jsonb_path_ops"))], type: Gin)
+}
+
+// ==================== 3. 合同审批域 ====================
+
+/// 取代 expo_contract
+model Contract {
+  id             String          @id @default(uuid(7))
+  showId         String          @map("show_id")
+  show           Show            @relation(fields: [showId], references: [id])
+  exhibitorId    String          @map("exhibitor_id")
+  exhibitor      Exhibitor       @relation(fields: [exhibitorId], references: [id])
+  typeId         String?         @map("type_id")
+  type           ContractType?   @relation(fields: [typeId], references: [id])
+  partyAId       String?         @map("party_a_id")
+  partyA         OrganizerParty? @relation(fields: [partyAId], references: [id])
+  contractNo     String          @map("contract_no") /// 编号规则 show001-ZWH
+  title          String?
+  pricingRuleId  String?         @map("pricing_rule_id") /// 折扣条款共读（取代两处硬编码）
+  pricingRule    PricingRule?    @relation(fields: [pricingRuleId], references: [id])
+  amountTotal    Decimal?        @map("amount_total") @db.Decimal(12, 2)
+  currency       String          @default("CNY")
+  partyBSnapshot Json?           @map("party_b_snapshot") @db.JsonB /// GSZCMC/QYXZ/CZLB_1..17 乙方快照原样保
+  status         ContractStatus  @default(DRAFT)
+  signedOn       DateTime?       @map("signed_on") @db.Date /// QSRQ
+  docxObjectKey  String?         @map("docx_object_key") /// FileName 生成的 docx
+  pdfObjectKey   String?         @map("pdf_object_key")
+  legacyExtra    Json?           @map("legacy_extra") @db.JsonB /// 旧代 contract01~11 列
+  createdBy      String?         @map("created_by")
+  createdAt      DateTime        @default(now()) @map("created_at")
+  updatedAt      DateTime        @updatedAt @map("updated_at")
+  voidedAt       DateTime?       @map("voided_at") /// 作废即触发 stage 回退 + log（修复旧缺陷）
+
+  approvals      ApprovalInstance[]
+  payments       PaymentRecord[]
+  invoices       Invoice[]
+  refundDeposits RefundDeposit[]
+  orderItems     OrderItem[]
+  siteOrders     SiteOrder[]
+
+  @@unique([showId, contractNo])
+  @@index([exhibitorId])
+  @@index([showId, status])
+  @@map("contract")
+
+  // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
+  @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@index([partyBSnapshot(ops: raw("jsonb_path_ops"))], type: Gin)
+}
+
+/// 取代 expo_contract_type（0=定金协议→dj_path，1=合同→ht_path）
+model ContractType {
+  id                String  @id @default(uuid(7))
+  code              String  @unique
+  name              String
+  isDepositOnly     Boolean @default(false) @map("is_deposit_only")
+  templateObjectKey String? @map("template_object_key")
+  active            Boolean @default(true)
+
+  contracts Contract[]
+
+  @@map("contract_type")
+}
+
+/// 审批链配置化：16 组合（ZDRDW_Type × SKDW_Type）+ 3/4 级（§6.2，写死在 PHP 里 → 数据）
+model ApprovalFlowDef {
+  id        String        @id @default(uuid(7))
+  zdrType   AssocUnitType @map("zdr_type")
+  skType    AssocUnitType @map("sk_type")
+  level     Int /// 1/2/3/4（3 级跳过副总）
+  roleCode  String        @map("role_code") /// 节点绑角色而非具体账号（旧系统绑死 207/209/210/217/222/223）
+  skipLevel Boolean       @default(false) @map("skip_level")
+  active    Boolean       @default(true)
+
+  @@unique([zdrType, skType, level])
+  @@map("approval_flow_def")
+}
+
+/// 取代 expo_contract_approval
+model ApprovalInstance {
+  id             String                 @id @default(uuid(7))
+  contractId     String                 @map("contract_id")
+  contract       Contract               @relation(fields: [contractId], references: [id])
+  boothId        String?                @map("booth_id") /// fenpeizw_id 展位分配
+  booth          ExhibitorBooth?        @relation(fields: [boothId], references: [id])
+  zdrType        AssocUnitType          @map("zdr_type")
+  skType         AssocUnitType          @map("sk_type")
+  status         ApprovalInstanceStatus @default(IN_PROGRESS)
+  sheetGenerated Boolean                @default(false) @map("sheet_generated") /// 全部通过才可生成审批单 SPD
+  sheetObjectKey String?                @map("sheet_object_key")
+  createdBy      String?                @map("created_by")
+  createdAt      DateTime               @default(now()) @map("created_at")
+  completedAt    DateTime?              @map("completed_at")
+  isDeleted      Boolean                @default(false) @map("is_deleted") /// 旧 is_del，改软删+审计
+
+  nodes     ApprovalNode[]
+  histories ApprovalHistory[]
+
+  @@index([contractId])
+  @@index([status])
+  @@map("approval_instance")
+}
+
+/// 取代 expo_contract_approval_node（status 0/1/2 → 枚举；节点 role/admin 任命分离）
+model ApprovalNode {
+  id         String             @id @default(uuid(7))
+  instanceId String             @map("instance_id")
+  instance   ApprovalInstance   @relation(fields: [instanceId], references: [id])
+  level      Int
+  roleCode   String             @map("role_code")
+  assigneeId String?            @map("assignee_id") /// → Member（任命可换人，不再绑死账号）
+  assignee   Member?            @relation("ApprovalNodeAssignee", fields: [assigneeId], references: [id])
+  status     ApprovalNodeStatus @default(PENDING)
+  comment    String?
+  actedAt    DateTime?          @map("acted_at")
+  createdAt  DateTime           @default(now()) @map("created_at")
+
+  histories ApprovalHistory[]
+
+  @@unique([instanceId, level])
+  @@map("approval_node")
+}
+
+/// 新审计流水（只追加，取代覆盖式 status 与"改判覆盖 approve_time 无审计"）
+model ApprovalHistory {
+  id         String              @id @default(uuid(7))
+  instanceId String              @map("instance_id")
+  instance   ApprovalInstance    @relation(fields: [instanceId], references: [id])
+  nodeId     String?             @map("node_id")
+  node       ApprovalNode?       @relation(fields: [nodeId], references: [id])
+  action     ApprovalAction
+  actorId    String              @map("actor_id")
+  actor      Member              @relation("ApprovalHistoryActor", fields: [actorId], references: [id])
+  fromStatus ApprovalNodeStatus? @map("from_status")
+  toStatus   ApprovalNodeStatus? @map("to_status")
+  reason     String?
+  occurredAt DateTime            @default(now()) @map("occurred_at")
+
+  @@index([instanceId, occurredAt])
+  @@map("approval_history")
+}
+
+// ==================== 4. 财务域 ====================
+
+/// 取代 expo_financial（金额字符串带千分位 → NUMERIC；币种+汇率快照 v2.0 补）
+model PaymentRecord {
+  id            String         @id @default(uuid(7))
+  showId        String?        @map("show_id")
+  exhibitorId   String?        @map("exhibitor_id")
+  exhibitor     Exhibitor?     @relation(fields: [exhibitorId], references: [id])
+  contractId    String?        @map("contract_id")
+  contract      Contract?      @relation(fields: [contractId], references: [id])
+  duesId        String?        @map("dues_id")
+  dues          ExhibitorDues? @relation(fields: [duesId], references: [id])
+  bankAccountId String?        @map("bank_account_id")
+  bankAccount   BankAccount?   @relation(fields: [bankAccountId], references: [id])
+  amount        Decimal        @db.Decimal(12, 2)
+  currency      String         @default("CNY") /// 收 expo_currency 的 USD 语义
+  exchangeRate  Decimal?       @map("exchange_rate") @db.Decimal(10, 4)
+  amountCny     Decimal?       @map("amount_cny") @db.Decimal(12, 2)
+  rateSnapshot  DateTime?      @map("rate_snapshot") @db.Date /// 取到账日还是录入日：待访谈（§13 币种与汇率）
+  channel       PaymentChannel @default(BANK_TRANSFER)
+  voucherNo     String?        @map("voucher_no")
+  paidOn        DateTime?      @map("paid_on") @db.Date
+  receivedOn    DateTime?      @map("received_on") @db.Date
+  memo          String?
+  legacyBlock   String?        @map("legacy_block") /// 原属哪把区块锁的旧列名
+  enteredBy     String?        @map("entered_by")
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+
+  invoices        Invoice[]
+  invoiceRequests InvoiceRequest[]
+
+  @@index([showId, receivedOn])
+  @@index([exhibitorId])
+  @@index([contractId])
+  @@map("payment_record")
+}
+
+/// 8 把区块锁显式化（§6.2：行式 + 留痕 + POST/CSRF/权限码，取代 GET 地址栏跳转）
+model ReceivableLock {
+  id           String          @id @default(uuid(7))
+  subjectType  AuditTargetKind @default(EXHIBITOR) @map("subject_type")
+  subjectId    String          @map("subject_id")
+  exhibitorId  String?         @map("exhibitor_id")
+  exhibitor    Exhibitor?      @relation(fields: [exhibitorId], references: [id])
+  block        LockBlock
+  status       LockStatus      @default(UNLOCKED)
+  lockedAt     DateTime?       @map("locked_at")
+  lockedById   String?         @map("locked_by_id")
+  lockedBy     Member?         @relation("LockBy", fields: [lockedById], references: [id])
+  unlockedAt   DateTime?       @map("unlocked_at")
+  unlockedById String?         @map("unlocked_by_id")
+  unlockedBy   Member?         @relation("LockUnlockedBy", fields: [unlockedById], references: [id])
+  unlockReason String?         @map("unlock_reason")
+
+  @@unique([subjectType, subjectId, block])
+  @@map("receivable_lock")
+}
+
+/// 取代 expo_invoice（+ expo_invoice_check）
+model Invoice {
+  id            String         @id @default(uuid(7))
+  invoiceNo     String?        @map("invoice_no")
+  invoiceCode   String?        @map("invoice_code")
+  kind          InvoiceKind    @default(VAT_GENERAL)
+  title         String
+  taxNo         String?        @map("tax_no")
+  amount        Decimal        @db.Decimal(12, 2)
+  currency      String         @default("CNY")
+  showId        String?        @map("show_id")
+  exhibitorId   String?        @map("exhibitor_id")
+  exhibitor     Exhibitor?     @relation(fields: [exhibitorId], references: [id])
+  contractId    String?        @map("contract_id")
+  contract      Contract?      @relation(fields: [contractId], references: [id])
+  paymentId     String?        @map("payment_id")
+  payment       PaymentRecord? @relation(fields: [paymentId], references: [id])
+  issuedOn      DateTime?      @map("issued_on") @db.Date
+  status        InvoiceStatus  @default(ISSUED)
+  fileObjectKey String?        @map("file_object_key")
+  checkNote     String?        @map("check_note") /// 旧 expo_invoice_check
+  checkedById   String?        @map("checked_by_id")
+  checkedAt     DateTime?      @map("checked_at")
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+
+  @@index([invoiceNo])
+  @@index([exhibitorId])
+  @@map("invoice")
+}
+
+/// 取代 expo_bank_deposit
+model BankDeposit {
+  id               String       @id @default(uuid(7))
+  bankAccountId    String?      @map("bank_account_id")
+  bankAccount      BankAccount? @relation(fields: [bankAccountId], references: [id])
+  depositedOn      DateTime     @map("deposited_on") @db.Date
+  amount           Decimal      @db.Decimal(12, 2)
+  currency         String       @default("CNY")
+  payerName        String?      @map("payer_name")
+  memo             String?
+  matchedPaymentId String?      @map("matched_payment_id")
+  importBatchId    String?      @map("import_batch_id")
+  createdAt        DateTime     @default(now()) @map("created_at")
+
+  @@index([depositedOn])
+  @@map("bank_deposit")
+}
+
+/// 取代 expo_refund_deposit
+model RefundDeposit {
+  id           String     @id @default(uuid(7))
+  exhibitorId  String?    @map("exhibitor_id")
+  exhibitor    Exhibitor? @relation(fields: [exhibitorId], references: [id])
+  contractId   String?    @map("contract_id")
+  contract     Contract?  @relation(fields: [contractId], references: [id])
+  amount       Decimal    @db.Decimal(12, 2)
+  currency     String     @default("CNY")
+  reason       String?
+  appliedOn    DateTime?  @map("applied_on") @db.Date
+  approvedAt   DateTime?  @map("approved_at")
+  approvedById String?    @map("approved_by_id")
+  refundedAt   DateTime?  @map("refunded_at")
+  status       String     @default("APPLIED")
+  remark       String?
+
+  @@index([exhibitorId])
+  @@map("refund_deposit")
+}
+
+/// 取代 expo_unknown_money（not_major 语义化）
+model UnknownPayment {
+  id          String    @id @default(uuid(7))
+  receivedOn  DateTime? @map("received_on") @db.Date
+  amount      Decimal   @db.Decimal(12, 2)
+  currency    String    @default("CNY")
+  payerHint   String?   @map("payer_hint")
+  evidenceKey String?   @map("evidence_key")
+  claimStatus String    @default("UNCLAIMED") @map("claim_status")
+  claimedById String?   @map("claimed_by_id")
+  claimedAt   DateTime? @map("claimed_at")
+  note        String?
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@map("unknown_payment")
+}
+
+/// 取代 expo_punishment（处罚/黑名单）
+model Punishment {
+  id          String          @id @default(uuid(7))
+  subjectType AuditTargetKind @map("subject_type")
+  subjectId   String          @map("subject_id")
+  kind        String /// BLACKLIST / FINE …
+  reason      String?
+  amount      Decimal?        @db.Decimal(12, 2)
+  issuedOn    DateTime?       @map("issued_on") @db.Date
+  liftedOn    DateTime?       @map("lifted_on") @db.Date
+  payload     Json?           @db.JsonB
+  createdAt   DateTime        @default(now()) @map("created_at")
+
+  @@index([subjectType, subjectId])
+  @@map("punishment")
+}
+
+/// 取代 expo_currency（币种/汇率字典）
+model CurrencyRate {
+  id          String   @id @default(uuid(7))
+  code        String /// USD / CNY …
+  nameCn      String?  @map("name_cn")
+  rateToUsd   Decimal? @map("rate_to_usd") @db.Decimal(10, 4) /// rate_usd
+  effectiveOn DateTime @map("effective_on") @db.Date
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@unique([code, effectiveOn])
+  @@map("currency_rate")
+}
+
+// ==================== 5. 订单域 ====================
+
+/// 取代 expo_order_types_big/small（+ _guozhan 变体、_temp 导入中转不迁）
+model ProductCategory {
+  id          String            @id @default(uuid(7))
+  parentId    String?           @map("parent_id")
+  parent      ProductCategory?  @relation("CategoryTree", fields: [parentId], references: [id])
+  children    ProductCategory[] @relation("CategoryTree")
+  level       Int               @default(1) /// 1=大类 2=小类
+  nameCn      String            @map("name_cn")
+  nameEn      String?           @map("name_en")
+  unitPrice   Decimal?          @map("unit_price") @db.Decimal(12, 2) /// 小类含价
+  currency    String            @default("CNY")
+  partitionId String?           @map("partition_id")
+  isGuozhan   Boolean           @default(false) @map("is_guozhan") /// expo_order_types_small_guozhan 口径
+  sortOrder   Int               @default(0) @map("sort_order")
+  active      Boolean           @default(true)
+  legacyExtra Json?             @map("legacy_extra") @db.JsonB
+
+  exhibitorsBig   Exhibitor[] @relation("ExhibitorBigCat")
+  exhibitorsSmall Exhibitor[] @relation("ExhibitorSmallCat")
+  orderItems      OrderItem[]
+  siteOrders      SiteOrder[]
+
+  @@index([parentId, level])
+  @@map("product_category")
+
+  // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
+  @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
+}
+
+/// 取代 expo_otb/ots（mb=收费项目模板，命名误导已按实际语义重建）
+model FeeTemplate {
+  id        String   @id @default(uuid(7))
+  parentId  String?  @map("parent_id")
+  nameCn    String   @map("name_cn")
+  nameEn    String?  @map("name_en")
+  level     Int      @default(1)
+  unitPrice Decimal? @map("unit_price") @db.Decimal(12, 2)
+  spec      String?
+  active    Boolean  @default(true)
+
+  billingRequests BillingRequest[]
+  siteOrders      SiteOrder[]
+
+  @@map("fee_template")
+}
+
+/// 取代 expo_order_list / _ex / _nums / _supplement（在线订购）
+model OrderItem {
+  id           String           @id @default(uuid(7))
+  showId       String           @map("show_id")
+  show         Show             @relation(fields: [showId], references: [id])
+  orderNo      String           @map("order_no") /// 编号生成改服务端序列，不再靠 expo_order_nums
+  exhibitorId  String?          @map("exhibitor_id")
+  exhibitor    Exhibitor?       @relation(fields: [exhibitorId], references: [id])
+  contractId   String?          @map("contract_id")
+  contract     Contract?        @relation(fields: [contractId], references: [id])
+  categoryId   String?          @map("category_id")
+  category     ProductCategory? @relation(fields: [categoryId], references: [id])
+  hallId       String?          @map("hall_id")
+  hall         ShowHall?        @relation(fields: [hallId], references: [id])
+  quantity     Int              @default(1)
+  unitPrice    Decimal          @default(0) @map("unit_price") @db.Decimal(12, 2)
+  amount       Decimal          @default(0) @db.Decimal(12, 2)
+  discountRate Decimal?         @map("discount_rate") @db.Decimal(6, 4)
+  isSupplement Boolean          @default(false) @map("is_supplement") /// expo_order_supplement
+  remark       String?
+  legacyExtra  Json?            @map("legacy_extra") @db.JsonB
+  createdAt    DateTime         @default(now()) @map("created_at")
+  updatedAt    DateTime         @updatedAt @map("updated_at")
+
+  payments OrderPayment[]
+
+  @@index([showId, orderNo]) /// 旧 order_nums 编号生成改服务端序列，不再靠临时表中转
+  @@index([exhibitorId])
+  @@map("order_item")
+
+  // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
+  @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
+}
+
+/// 取代 expo_order_pay（op_order_statue N/Y → payStatus 枚举）
+model OrderPayment {
+  id            String         @id @default(uuid(7))
+  orderItemId   String         @map("order_item_id")
+  orderItem     OrderItem      @relation(fields: [orderItemId], references: [id])
+  payStatus     String         @default("UNPAID") @map("pay_status") /// PAID / UNPAID
+  amount        Decimal        @default(0) @db.Decimal(12, 2)
+  currency      String         @default("CNY")
+  method        PaymentChannel @default(BANK_TRANSFER)
+  transactionNo String?        @map("transaction_no")
+  paidAt        DateTime?      @map("paid_at")
+  operatorId    String?        @map("operator_id")
+  remark        String?
+
+  @@index([orderItemId])
+  @@index([payStatus])
+  @@map("order_payment")
+}
+
+/// 取代 expo_site_order（pso_* 现场/服务预订）
+model SiteOrder {
+  id            String           @id @default(uuid(7))
+  showId        String           @map("show_id")
+  show          Show             @relation(fields: [showId], references: [id])
+  exhibitorId   String?          @map("exhibitor_id")
+  exhibitor     Exhibitor?       @relation(fields: [exhibitorId], references: [id])
+  contractId    String?          @map("contract_id")
+  contract      Contract?        @relation(fields: [contractId], references: [id])
+  categoryId    String?          @map("category_id")
+  category      ProductCategory? @relation(fields: [categoryId], references: [id])
+  feeTemplateId String?          @map("fee_template_id")
+  feeTemplate   FeeTemplate?     @relation(fields: [feeTemplateId], references: [id])
+  quantity      Int              @default(1)
+  amount        Decimal          @default(0) @db.Decimal(12, 2)
+  bookedOn      DateTime?        @map("booked_on") @db.Date
+  status        String           @default("BOOKED")
+  remark        String?
+  legacyExtra   Json?            @map("legacy_extra") @db.JsonB
+
+  @@index([exhibitorId])
+  @@map("site_order")
+
+  // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
+  @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
+}
+
+// ==================== 6. 观众域 ====================
+
+/// 取代 expo_visit（观众实体）；expo_visitor 死引用不迁
+model Visitor {
+  id              String        @id @default(uuid(7))
+  nameCn          String?       @map("name_cn")
+  nameEn          String?       @map("name_en")
+  gender          String?
+  mobile          String?
+  email           String?
+  companyName     String?       @map("company_name")
+  positionId      String?       @map("position_id") /// expo_position 字典
+  industryBigId   String?       @map("industry_big_id") /// expo_project_types_big
+  industrySmallId String?       @map("industry_small_id") /// _small
+  countryRegion   String?       @map("country_region")
+  provinceCode    String?       @map("province_code")
+  cityCode        String?       @map("city_code")
+  districtCode    String?       @map("district_code")
+  address         String?
+  source          VisitorSource @default(LEGACY_PC)
+  legacyRef       String?       @map("legacy_ref") /// 旧表 id（桥③回流与去重回查）
+  memberId        String?       @map("member_id") /// 统一账户归并（§7）
+  member          Member?       @relation("VisitorMember", fields: [memberId], references: [id])
+  isMerged        Boolean       @default(false) @map("is_merged") /// 模糊去重结果（禁止再拿公司名当主键）
+  mergedIntoId    String?       @map("merged_into_id")
+  legacyExtra     Json?         @map("legacy_extra") @db.JsonB /// personnelXX 编号字段原样保
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+
+  registrations VisitorRegistration[]
+  visitHistory  VisitorVisitHistory[]
+  contacts      VisitorContact[]
+  contactLogs   VisitorContactLog[]
+
+  @@index([mobile])
+  @@index([email])
+  @@index([memberId])
+  @@map("visitor")
+
+  // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
+  @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
+}
+
+/// 取代 expo_visitor_online / expo_visit_online / wwz_visitor_register（合并统一数据）
+model VisitorRegistration {
+  id             String             @id @default(uuid(7))
+  showId         String             @map("show_id")
+  show           Show               @relation(fields: [showId], references: [id])
+  visitorId      String             @map("visitor_id")
+  visitor        Visitor            @relation(fields: [visitorId], references: [id])
+  registrationNo String             @unique @map("registration_no")
+  ticketKind     TicketKind         @default(EARLY_BIRD) @map("ticket_kind")
+  status         RegistrationStatus @default(PENDING)
+  source         VisitorSource      @default(PORTAL_PREREG)
+  legacyRef      String?            @map("legacy_ref")
+  memberId       String?            @map("member_id") /// 桥③回流必带新会员 ID 映射（§3.2 单写纪律）
+  approvedById   String?            @map("approved_by_id")
+  registeredAt   DateTime           @default(now()) @map("registered_at")
+  approvedAt     DateTime?          @map("approved_at")
+  checkedInAt    DateTime?          @map("checked_in_at") /// 现场核销
+  checkInGate    String?            @map("check_in_gate")
+  flowbackStatus FlowbackStatus     @default(NOT_SENT) @map("flowback_status")
+  flowbackAt     DateTime?          @map("flowback_at")
+  flowbackError  String?            @map("flowback_error")
+  data           Json?              @db.JsonB /// 表单扩展字段（行业/关注品类等）
+
+  eTickets ETicket[]
+
+  @@unique([showId, visitorId])
+  @@index([showId, status])
+  @@index([flowbackStatus])
+  @@map("visitor_registration")
+
+  // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
+  @@index([data(ops: raw("jsonb_path_ops"))], type: Gin)
+}
+
+/// 取代 expo_visit_b（观众×届次 回头客）
+model VisitorVisitHistory {
+  id        String    @id @default(uuid(7))
+  visitorId String    @map("visitor_id")
+  visitor   Visitor   @relation(fields: [visitorId], references: [id])
+  showId    String    @map("show_id")
+  show      Show      @relation(fields: [showId], references: [id])
+  times     Int       @default(1)
+  firstSeen DateTime? @map("first_seen")
+  lastSeen  DateTime? @map("last_seen")
+
+  @@unique([visitorId, showId])
+  @@map("visitor_visit_history")
+}
+
+/// 取代 expo_visit_c（personnelXX 编号字段）
+model VisitorContact {
+  id          String  @id @default(uuid(7))
+  visitorId   String  @map("visitor_id")
+  visitor     Visitor @relation(fields: [visitorId], references: [id])
+  label       String?
+  name        String?
+  title       String?
+  phone       String?
+  email       String?
+  legacyExtra Json?   @map("legacy_extra") @db.JsonB
+
+  @@index([visitorId])
+  @@map("visitor_contact")
+
+  // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
+  @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
+}
+
+/// 取代 expo_visit_r（联系记录）
+model VisitorContactLog {
+  id         String   @id @default(uuid(7))
+  visitorId  String   @map("visitor_id")
+  visitor    Visitor  @relation(fields: [visitorId], references: [id])
+  authorId   String?  @map("author_id")
+  author     Member?  @relation("VisitorContactAuthor", fields: [authorId], references: [id])
+  content    String
+  occurredAt DateTime @default(now()) @map("occurred_at")
+
+  @@index([visitorId, occurredAt])
+  @@map("visitor_contact_log")
+}
+
+// ==================== 7. 资料域（废除 expo_data_top.TName 动态注册 → 六类实表）====================
+
+/// 取代 expo_data_zpyl（展品信息）
+model ProductItem {
+  id           String    @id @default(uuid(7))
+  exhibitorId  String    @map("exhibitor_id")
+  exhibitor    Exhibitor @relation(fields: [exhibitorId], references: [id])
+  nameCn       String?   @map("name_cn") /// ZPMC
+  nameEn       String?   @map("name_en")
+  model        String? /// ZPXH
+  intro        String? /// ZPJS
+  imageKey     String?   @map("image_key") /// ZPTP → OSS 私有桶 objectKey
+  categoryCode String?   @map("category_code") /// ZPLB 1-14
+  sortOrder    Int       @default(0) @map("sort_order") /// XSSX 显示顺序
+  submitted    Boolean   @default(false) /// IsSubmit
+  legacyExtra  Json?     @map("legacy_extra") @db.JsonB
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  @@index([exhibitorId])
+  @@index([nameCn])
+  @@map("product_item")
+
+  // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
+  @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@index([nameCn(ops: raw("gin_trgm_ops"))], type: Gin, map: "product_item_name_cn_trgm_gin")
+}
+
+/// 取代 expo_data_hkxx（会刊信息）
+model YearbookInfo {
+  id          String    @id @default(uuid(7))
+  exhibitorId String    @unique @map("exhibitor_id")
+  exhibitor   Exhibitor @relation(fields: [exhibitorId], references: [id])
+  introCn     String?   @map("intro_cn") /// GSJJ_CN
+  introEn     String?   @map("intro_en")
+  submitted   Boolean   @default(false)
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  @@map("yearbook_info")
+}
+
+/// 取代 expo_data_czzj（参展证件）
+model Badge {
+  id          String    @id @default(uuid(7))
+  exhibitorId String    @map("exhibitor_id")
+  exhibitor   Exhibitor @relation(fields: [exhibitorId], references: [id])
+  personName  String?   @map("person_name") /// RYXM
+  title       String? /// ZW
+  country     String? /// GB
+  idType      String?   @map("id_type") /// ZJLX
+  idNo        String?   @map("id_no") /// ZJHM（PII，展示脱敏）
+  mobile      String? /// SJH（PII）
+  submitted   Boolean   @default(false)
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@index([exhibitorId])
+  @@map("badge")
+}
+
+/// 取代 expo_data_yqh（邀请函申请）
+model Invitation {
+  id          String    @id @default(uuid(7))
+  exhibitorId String    @map("exhibitor_id")
+  exhibitor   Exhibitor @relation(fields: [exhibitorId], references: [id])
+  quantity    Int       @default(0) /// Num
+  remark      String?
+  submitted   Boolean   @default(false)
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@index([exhibitorId])
+  @@map("invitation")
+}
+
+/// 取代 expo_data_mb（mb≠楣板：收费项目申报，共读 FeeTemplate）
+model BillingRequest {
+  id            String       @id @default(uuid(7))
+  exhibitorId   String       @map("exhibitor_id")
+  exhibitor     Exhibitor    @relation(fields: [exhibitorId], references: [id])
+  feeTemplateId String?      @map("fee_template_id")
+  feeTemplate   FeeTemplate? @relation(fields: [feeTemplateId], references: [id])
+  quantity      Int          @default(1)
+  amount        Decimal?     @db.Decimal(12, 2)
+  spec          String?
+  remark        String?
+  submitted     Boolean      @default(false)
+  createdAt     DateTime     @default(now()) @map("created_at")
+
+  @@index([exhibitorId])
+  @@map("billing_request")
+}
+
+/// 取代 expo_data_jlhd（交流活动）+ pte_event（门户活动，统一数据）
+model EventActivity {
+  id               String     @id @default(uuid(7))
+  showId           String?    @map("show_id")
+  show             Show?      @relation(fields: [showId], references: [id])
+  exhibitorId      String?    @map("exhibitor_id")
+  exhibitor        Exhibitor? @relation(fields: [exhibitorId], references: [id])
+  nameCn           String?    @map("name_cn") /// HDMC / etitle
+  nameEn           String?    @map("name_en")
+  venue            String? /// HDDD / eplace
+  startsAt         DateTime?  @map("starts_at") /// HDSJ / edate+etime
+  endsAt           DateTime?  @map("ends_at")
+  expectedVisitors Int?       @map("expected_visitors") /// CXRS
+  content          String? /// HDNR
+  source           String     @default("EXPO") /// EXPO=资料子库 / PORTAL=门户
+  submitted        Boolean    @default(false)
+  createdAt        DateTime   @default(now()) @map("created_at")
+  updatedAt        DateTime   @updatedAt @map("updated_at")
+
+  @@index([showId, startsAt])
+  @@map("event_activity")
+}
+
+/// 取代 query_pagination(任意表名) 拖库通道（§6.4/§9 S2：白名单注册表）
+model QueryRegistry {
+  id                String   @id @default(uuid(7))
+  code              String   @unique
+  targetView        String   @map("target_view") /// 只允许登记过的只读视图
+  allowedColumns    Json     @map("allowed_columns") @db.JsonB
+  allowedPredicates Json?    @map("allowed_predicates") @db.JsonB
+  publicApi         Boolean  @default(false) @map("public_api")
+  rateLimitPerMin   Int      @default(60) @map("rate_limit_per_min")
+  description       String?
+  active            Boolean  @default(true)
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  apiKeys ApiKeyRegistry[]
+
+  @@map("query_registry")
+}
+
+/// 对外 API 的 OAuth 式 Key（配 限流 + 吊销）
+model ApiKey {
+  id              String    @id @default(uuid(7))
+  name            String
+  keyHash         String    @unique @map("key_hash") /// 只存哈希，不存明文
+  ownerType       String    @default("INTERNAL") @map("owner_type")
+  rateLimitPerMin Int       @default(120) @map("rate_limit_per_min")
+  revokedAt       DateTime? @map("revoked_at")
+  lastUsedAt      DateTime? @map("last_used_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+
+  registries ApiKeyRegistry[]
+
+  @@map("api_key")
+}
+
+model ApiKeyRegistry {
+  id         String        @id @default(uuid(7))
+  apiKeyId   String        @map("api_key_id")
+  apiKey     ApiKey        @relation(fields: [apiKeyId], references: [id])
+  registryId String        @map("registry_id")
+  registry   QueryRegistry @relation(fields: [registryId], references: [id])
+
+  @@unique([apiKeyId, registryId])
+  @@map("api_key_registry")
+}
+
+// ==================== 8. 会员域（新增，对标 MyChinaplas）====================
+
+/// 一表三身份（观众/展商/员工）；旧 expo_admin + pte_user + expo_order_login + itma_pas 归并于此
+model Member {
+  id                 String            @id @default(uuid(7))
+  displayName        String?           @map("display_name")
+  mobile             String?           @unique
+  email              String?           @unique
+  passwordHash       String?           @map("password_hash")
+  hashAlgorithm      PasswordAlgorithm @default(ARGON2ID) @map("hash_algorithm")
+  mustChangePassword Boolean           @default(false) @map("must_change_password") /// 旧 MD5 迁移强制首登改密
+  status             String            @default("ACTIVE") /// ACTIVE/LOCKED/CANCELLED
+  failedLoginCount   Int               @default(0) @map("failed_login_count")
+  lockedUntil        DateTime?         @map("locked_until")
+  lastLoginAt        DateTime?         @map("last_login_at")
+  legacyRef          String?           @map("legacy_ref") /// 旧账号来源（expo_admin.id / expo_exhibitors.015 …）
+  createdAt          DateTime          @default(now()) @map("created_at")
+  updatedAt          DateTime          @updatedAt @map("updated_at")
+
+  identities      MemberIdentity[]
+  roles           MemberRole[]
+  wechatBindings  WechatBinding[]
+  favorites       Favorite[]
+  footprints      Footprint[]
+  namecards       Namecard[]
+  eTickets        ETicket[]
+  invoiceRequests InvoiceRequest[]
+  stageLogsActor  ExhibitorStageLog[]   @relation("StageLogActor")
+  contactLogs     ExhibitorContactLog[] @relation("ExhibitorContactAuthor")
+  visitorContacts VisitorContactLog[]   @relation("VisitorContactAuthor")
+  visitors        Visitor[]             @relation("VisitorMember")
+  approvalNodes   ApprovalNode[]        @relation("ApprovalNodeAssignee")
+  approvalHistory ApprovalHistory[]     @relation("ApprovalHistoryActor")
+  lockBy          ReceivableLock[]      @relation("LockBy")
+  lockUnlockedBy  ReceivableLock[]      @relation("LockUnlockedBy")
+  auditLogs       AuditLog[]
+  exportJobs      ExportJob[]
+  dataScopes      DataScope[]
+  staffProfile    StaffProfile?
+
+  @@map("member")
+}
+
+model MemberIdentity {
+  id          String     @id @default(uuid(7))
+  memberId    String     @map("member_id")
+  member      Member     @relation(fields: [memberId], references: [id])
+  kind        MemberKind
+  refId       String?    @map("ref_id") /// exhibitorId / 其它域主键
+  exhibitorId String?    @map("exhibitor_id")
+  exhibitor   Exhibitor? @relation(fields: [exhibitorId], references: [id])
+  isPrimary   Boolean    @default(false) @map("is_primary")
+  verifiedAt  DateTime?  @map("verified_at")
+  createdAt   DateTime   @default(now()) @map("created_at")
+
+  @@index([memberId, kind, refId]) /// 部分唯一索引：WHERE ref_id IS NOT NULL
+  @@index([kind, refId])
+  @@map("member_identity")
+}
+
+model WechatBinding {
+  id       String   @id @default(uuid(7))
+  memberId String   @map("member_id")
+  member   Member   @relation(fields: [memberId], references: [id])
+  openid   String   @unique
+  unionid  String?
+  nickname String?
+  boundAt  DateTime @default(now()) @map("bound_at")
+
+  @@map("wechat_binding")
+}
+
+model Favorite {
+  id         String   @id @default(uuid(7))
+  memberId   String   @map("member_id")
+  member     Member   @relation(fields: [memberId], references: [id])
+  targetType String   @map("target_type") /// EXHIBITOR/PRODUCT/EVENT/ARTICLE
+  targetId   String   @map("target_id")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@unique([memberId, targetType, targetId])
+  @@map("favorite")
+}
+
+model Footprint {
+  id         String   @id @default(uuid(7))
+  memberId   String   @map("member_id")
+  member     Member   @relation(fields: [memberId], references: [id])
+  targetType String   @map("target_type")
+  targetId   String   @map("target_id")
+  viewedAt   DateTime @default(now()) @map("viewed_at")
+
+  @@index([memberId, viewedAt])
+  @@map("footprint")
+}
+
+model Namecard {
+  id        String   @id @default(uuid(7))
+  memberId  String   @map("member_id")
+  member    Member   @relation(fields: [memberId], references: [id])
+  company   String?
+  title     String?
+  phone     String?
+  email     String?
+  wechatId  String?  @map("wechat_id")
+  qrPayload String?  @map("qr_payload")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([memberId])
+  @@map("namecard")
+}
+
+/// 电子参观证（sharp 预制模板合成，禁 headless Chrome；§4.1）
+model ETicket {
+  id             String               @id @default(uuid(7))
+  serialNo       String               @unique @map("serial_no")
+  showId         String?              @map("show_id")
+  registrationId String?              @map("registration_id")
+  registration   VisitorRegistration? @relation(fields: [registrationId], references: [id])
+  memberId       String?              @map("member_id")
+  member         Member?              @relation(fields: [memberId], references: [id])
+  holderName     String?              @map("holder_name")
+  holderMobile   String?              @map("holder_mobile") /// 展示脱敏
+  qrPayload      String?              @map("qr_payload")
+  status         ETicketStatus        @default(ISSUED)
+  pdfObjectKey   String?              @map("pdf_object_key")
+  issuedAt       DateTime             @default(now()) @map("issued_at")
+  usedAt         DateTime?            @map("used_at")
+  gate           String?
+
+  @@index([showId, status])
+  @@map("e_ticket")
+}
+
+/// 自助开票（打通财务域）
+model InvoiceRequest {
+  id          String         @id @default(uuid(7))
+  memberId    String         @map("member_id")
+  member      Member         @relation(fields: [memberId], references: [id])
+  paymentId   String?        @map("payment_id")
+  payment     PaymentRecord? @relation(fields: [paymentId], references: [id])
+  title       String
+  taxNo       String?        @map("tax_no")
+  kind        InvoiceKind    @default(VAT_GENERAL)
+  amount      Decimal        @db.Decimal(12, 2)
+  email       String?
+  phone       String?
+  status      String         @default("SUBMITTED") /// SUBMITTED/APPROVED/ISSUED/REJECTED
+  invoiceId   String?        @map("invoice_id")
+  requestedAt DateTime       @default(now()) @map("requested_at")
+  processedBy String?        @map("processed_by")
+  processedAt DateTime?      @map("processed_at")
+  note        String?
+
+  @@index([memberId])
+  @@map("invoice_request")
+}
+
+/// 验证码与三兜底通道（国际：短信/语音/扫码）；短时效与吊销在 Redis
+model SmsVerifyLog {
+  id            String     @id @default(uuid(7))
+  mobile        String
+  scene         SmsScene
+  channel       SmsChannel @default(SMS)
+  codeHash      String?    @map("code_hash")
+  sentAt        DateTime   @default(now()) @map("sent_at")
+  expiresAt     DateTime   @map("expires_at")
+  verifiedAt    DateTime?  @map("verified_at")
+  failCount     Int        @default(0) @map("fail_count")
+  lockedUntil   DateTime?  @map("locked_until")
+  ip            String?
+  providerMsgId String?    @map("provider_msg_id")
+
+  @@index([mobile, scene, sentAt])
+  @@map("sms_verify_log")
+}
+
+// ==================== 平台基座：RBAC / 审计 / 内容 / 文件 / 任务 ====================
+
+model Role {
+  id          String  @id @default(uuid(7))
+  code        String  @unique
+  name        String
+  description String?
+  isSystem    Boolean @default(false) @map("is_system")
+
+  permissions RolePermission[]
+  members     MemberRole[]
+
+  @@map("role")
+}
+
+model Permission {
+  id    String  @id @default(uuid(7))
+  code  String  @unique /// financial.lock.toggle / contract.approve / export.pii …
+  name  String
+  group String?
+
+  roles RolePermission[]
+
+  @@map("permission")
+}
+
+model RolePermission {
+  id           String     @id @default(uuid(7))
+  roleId       String     @map("role_id")
+  role         Role       @relation(fields: [roleId], references: [id])
+  permissionId String     @map("permission_id")
+  permission   Permission @relation(fields: [permissionId], references: [id])
+
+  @@unique([roleId, permissionId])
+  @@map("role_permission")
+}
+
+model MemberRole {
+  id        String   @id @default(uuid(7))
+  memberId  String   @map("member_id")
+  member    Member   @relation(fields: [memberId], references: [id])
+  roleId    String   @map("role_id")
+  role      Role     @relation(fields: [roleId], references: [id])
+  grantedBy String?  @map("granted_by")
+  grantedAt DateTime @default(now()) @map("granted_at")
+
+  @@unique([memberId, roleId])
+  @@map("member_role")
+}
+
+/// 取代 hall01~20 布尔列 + expo_partition_power：角色 × (届次×展馆) 两维授权（§9）
+model DataScope {
+  id       String    @id @default(uuid(7))
+  memberId String?   @map("member_id")
+  member   Member?   @relation(fields: [memberId], references: [id])
+  roleId   String?   @map("role_id")
+  hallId   String?   @map("hall_id")
+  hall     ShowHall? @relation(fields: [hallId], references: [id])
+  showId   String?   @map("show_id")
+  level    String    @default("HALL") /// SHOW/HALL/PARTITION
+
+  @@index([memberId])
+  @@map("data_scope")
+}
+
+model StaffProfile {
+  id         String   @id @default(uuid(7))
+  memberId   String   @unique @map("member_id")
+  member     Member   @relation(fields: [memberId], references: [id])
+  employeeNo String?  @map("employee_no")
+  department String?
+  position   String?
+  active     Boolean  @default(true) /// 旧 state 软删
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@map("staff_profile")
+}
+
+/// 取代 expo_log；同时是切换日「数据回补预案」的重放来源（§8 铁规三）
+model AuditLog {
+  id          String          @id @default(uuid(7))
+  actorId     String?         @map("actor_id")
+  actor       Member?         @relation(fields: [actorId], references: [id])
+  actorKind   String          @default("STAFF") @map("actor_kind") /// STAFF/EXHIBITOR/SYSTEM
+  action      String /// CREATE/UPDATE/DELETE/LOGIN/EXPORT/LOCK/UNLOCK/APPROVE…
+  targetKind  AuditTargetKind @map("target_kind")
+  targetId    String?         @map("target_id")
+  legacyTable String?         @map("legacy_table") /// 老库对应表名（回补重放用）
+  legacyPk    String?         @map("legacy_pk") /// 老库对应主键（回补重放用）
+  sqlKind     SqlKind?        @map("sql_kind")
+  before      Json?           @db.JsonB
+  after       Json?           @db.JsonB
+  payload     Json?           @db.JsonB
+  ip          String?
+  userAgent   String?         @map("user_agent")
+  occurredAt  DateTime        @default(now()) @map("occurred_at")
+
+  @@index([targetKind, targetId, occurredAt])
+  @@index([actorId, occurredAt])
+  @@index([occurredAt])
+  @@map("audit_log")
+
+  // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
+  @@index([after(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@index([payload(ops: raw("jsonb_path_ops"))], type: Gin)
+}
+
+/// 取代 pte_category（无限级 + lang 分中英）
+model ContentCategory {
+  id        String      @id @default(uuid(7))
+  parentId  String?     @map("parent_id")
+  slug      String
+  nameCn    String      @map("name_cn")
+  nameEn    String?     @map("name_en")
+  lang      ContentLang @default(zh)
+  isLabel   Boolean     @default(false) @map("is_label") /// islabel
+  sortOrder Int         @default(0) @map("sort_order")
+  isDeleted Boolean     @default(false) @map("is_deleted")
+  createdAt DateTime    @default(now()) @map("created_at")
+
+  parent   ContentCategory?  @relation("CategoryTree", fields: [parentId], references: [id])
+  children ContentCategory[] @relation("CategoryTree")
+  articles Article[]
+
+  @@unique([lang, slug])
+  @@map("content_category")
+}
+
+/// 取代 pte_article（列表/SEO）+ pte_article_details（正文，UEditor HTML 净化后入列）
+model Article {
+  id           String           @id @default(uuid(7))
+  categoryId   String?          @map("category_id")
+  category     ContentCategory? @relation(fields: [categoryId], references: [id])
+  title        String
+  summary      String?
+  coverKey     String?          @map("cover_key") /// poster → OSS objectKey
+  bodyHtml     String?          @map("body_html") /// 净化后的正文（HTML sanitize 在 server 层强制）
+  lang         ContentLang      @default(zh)
+  sourceLangId String?          @map("source_lang_id") /// 英文稿对应的中文稿（双语工作流）
+  sourceLang   Article?         @relation("ArticleLangPair", fields: [sourceLangId], references: [id])
+  translations Article[]        @relation("ArticleLangPair")
+  isTop        Boolean          @default(false) @map("is_top")
+  sortOrder    Int              @default(0) @map("sort_order")
+  isOnline     Boolean          @default(true) @map("is_online") /// isonline
+  isDeleted    Boolean          @default(false) @map("is_deleted")
+  publishedAt  DateTime?        @map("published_at")
+  seoTitle     String?          @map("seo_title")
+  seoKeywords  String?          @map("seo_keywords")
+  legacyRef    String?          @map("legacy_ref") /// 旧 aid/pid（301 映射与 SEO 无损验收用）
+  createdBy    String?          @map("created_by")
+  createdAt    DateTime         @default(now()) @map("created_at")
+  updatedAt    DateTime         @updatedAt @map("updated_at")
+
+  translations2 ArticleTranslation[]
+
+  @@index([lang, isOnline, publishedAt])
+  @@index([categoryId])
+  @@map("article")
+}
+
+/// 双语内容工作流（投标版 A 档，§7）：中文定稿 → LLM 初译 → 人工确认发布
+model ArticleTranslation {
+  id             String            @id @default(uuid(7))
+  articleId      String            @map("article_id")
+  article        Article           @relation(fields: [articleId], references: [id])
+  targetLang     ContentLang       @map("target_lang")
+  machineDraft   String?           @map("machine_draft")
+  humanReviewed  String?           @map("human_reviewed")
+  status         TranslationStatus @default(SOURCE_FINAL)
+  llmModel       String?           @map("llm_model")
+  terminologyKey String?           @map("terminology_key") /// 术语表版本
+  translatedAt   DateTime?         @map("translated_at")
+  reviewedBy     String?           @map("reviewed_by")
+  reviewedAt     DateTime?         @map("reviewed_at")
+  updatedAt      DateTime          @updatedAt @map("updated_at")
+
+  @@unique([articleId, targetLang])
+  @@map("article_translation")
+}
+
+/// 取代 pte_event_info / pte_expo_info（门户登记：eid 硬编码 '2026' 的历史坑改由 showId 承载）
+model PortalRegistration {
+  id        String   @id @default(uuid(7))
+  showId    String?  @map("show_id")
+  kind      String /// VISIT / EXPO / CONFERENCE
+  name      String?
+  company   String?
+  job       String?
+  contact   String?
+  email     String?
+  mobile    String?
+  nums      String?
+  certs     String?
+  eventId   String?  @map("event_id") /// pte_event_info.eid 管道串
+  legacyRef String?  @map("legacy_ref")
+  data      Json?    @db.JsonB
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([showId, kind])
+  @@map("portal_registration")
+}
+
+/// 取代 pte_user（旧后台管理员，md5 password/islock）→ 归并入 Member + StaffProfile 之外的历史留档
+model LegacyAccount {
+  id         String    @id @default(uuid(7))
+  source     String /// expo_admin / pte_user / expo_order_login
+  externalId String    @map("external_id")
+  username   String?
+  email      String?
+  legacyHash String?   @map("legacy_hash") /// 无盐 MD5 原样保，供兼容校验后重设
+  memberId   String?   @map("member_id")
+  migratedAt DateTime? @map("migrated_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  @@unique([source, externalId])
+  @@map("legacy_account")
+}
+
+/// 文件资产（阶段1 清单化迁移 §8 铁规一：只迁数据库不迁文件=半截迁移）
+model MediaAsset {
+  id          String    @id @default(uuid(7))
+  bucketKind  String    @default("PRIVATE") @map("bucket_kind") /// PRIVATE(媒体/导出件) / STATIC(oss+h5 产物)
+  objectKey   String    @unique @map("object_key")
+  fileName    String    @map("file_name")
+  mime        String?
+  sizeBytes   BigInt?   @map("size_bytes")
+  width       Int?
+  height      Int?
+  sha256      String?
+  kind        String? /// CONTRACT_SCAN / EXHIBITOR_PHOTO / CAD_DRAWING / EXPORT / FLOOR_PLAN / ARTICLE_IMAGE
+  exhibitorId String?   @map("exhibitor_id")
+  legacyPath  String?   @map("legacy_path") /// 老服务器 upload/ 相对路径（URL 映射表与 field-mapping 同级管理）
+  uploadedBy  String?   @map("uploaded_by")
+  uploadedAt  DateTime  @default(now()) @map("uploaded_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  exportJobs ExportJob[]
+
+  @@index([kind])
+  @@index([legacyPath])
+  @@map("media_asset")
+}
+
+/// 取代"TRUNCATE 临时表 + 逐行 echo"流式土办法；PII 导出走签名 URL 15 分钟 + 7 天清理（§9 S10）
+model ExportJob {
+  id            String          @id @default(uuid(7))
+  kind          String /// financial_summary / dues / member_list / directory …
+  params        Json?           @db.JsonB
+  requesterId   String?         @map("requester_id")
+  requester     Member?         @relation(fields: [requesterId], references: [id])
+  status        ExportJobStatus @default(QUEUED)
+  queueName     String          @default("export") @map("queue_name")
+  resultAssetId String?         @map("result_asset_id")
+  resultAsset   MediaAsset?     @relation(fields: [resultAssetId], references: [id])
+  rowCount      Int?            @map("row_count")
+  error         String?
+  signedUntil   DateTime?       @map("signed_until")
+  purgeAfter    DateTime?       @map("purge_after")
+  requestedAt   DateTime        @default(now()) @map("requested_at")
+  finishedAt    DateTime?       @map("finished_at")
+
+  @@index([kind, status])
+  @@map("export_job")
+}
+
+/// 取代各 *_temp 表（TRUNCATE 全表互踩 → 改按任务隔离的导入批次）
+model ImportBatch {
+  id            String    @id @default(uuid(7))
+  kind          String /// EXHIBITOR / ORDER / FINANCIAL / OPT_TYPES / VISITOR
+  fileName      String?   @map("file_name")
+  sourceAssetId String?   @map("source_asset_id")
+  rowCount      Int       @default(0) @map("row_count")
+  errorCount    Int       @default(0) @map("error_count")
+  status        String    @default("QUEUED")
+  queueName     String    @default("import") @map("queue_name")
+  params        Json?     @db.JsonB
+  createdBy     String?   @map("created_by")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  finishedAt    DateTime? @map("finished_at")
+
+  errors ImportBatchError[]
+
+  @@index([kind, status])
+  @@map("import_batch")
+}
+
+model ImportBatchError {
+  id       String      @id @default(uuid(7))
+  batchId  String      @map("batch_id")
+  batch    ImportBatch @relation(fields: [batchId], references: [id])
+  rowNo    Int?        @map("row_no")
+  column   String?
+  message  String
+  rawValue String?     @map("raw_value")
+
+  @@index([batchId])
+  @@map("import_batch_error")
+}
+
+/// 字典：行政区划 bs_province/bs_city/bs_area（跨系统共用，单独导数据；§11-3 归属待裁决）
+model GeoDict {
+  id         String  @id @default(uuid(7))
+  level      Int /// 1 省 2 市 3 区
+  code       String
+  parentCode String? @map("parent_code")
+  nameCn     String  @map("name_cn")
+  nameEn     String? @map("name_en")
+  active     Boolean @default(true)
+
+  @@unique([code])
+  @@index([parentCode])
+  @@map("geo_dict")
+}
+
+/// 字典：国家/地区（expo_country）、职务（expo_position）、企业性质/类型等小字典统一收口
+model CodeDict {
+  id        String  @id @default(uuid(7))
+  group     String /// country / position / company_nature / company_type / hall …
+  code      String
+  labelCn   String  @map("label_cn")
+  labelEn   String? @map("label_en")
+  sortOrder Int     @default(0) @map("sort_order")
+  active    Boolean @default(true)
+
+  @@unique([group, code])
+  @@map("code_dict")
+}
+
+/// 报表基线快照（§8 第 4 步：迁移前固化现网 financial_total_1~5 + Summary 数字，逐张比对）
+model ReportBaseline {
+  id        String   @id @default(uuid(7))
+  showId    String?  @map("show_id")
+  reportKey String   @map("report_key") /// financial_total_1..5 / summary / tj_cdfp / tj_zwxs
+  params    Json?    @db.JsonB /// 同参数复算所需入参
+  expected  Json     @db.JsonB /// 现网导出数字（甲方签字基线）
+  actual    Json?    @db.JsonB /// 新系统复算数字
+  diff      Json?    @db.JsonB
+  verdict   String   @default("PENDING") /// PENDING/MATCH/WRITE_OFF(书面归因)/SIGNED(甲方签认)
+  note      String?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([reportKey, showId]) /// 同参数基线一行；多参数场景由 params 承载并走人工签认
+  @@map("report_baseline")
+
+  // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
+  @@index([expected(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@index([actual(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@index([diff(ops: raw("jsonb_path_ops"))], type: Gin)
+}
+
+/// 长尾报表处置签认（投标版：逐张确认"迁移/只读归档"）
+model LongTailReport {
+  id           String    @id @default(uuid(7))
+  reportKey    String    @map("report_key")
+  nameCn       String?   @map("name_cn")
+  sourceObject String?   @map("source_object") /// 旧视图/SP/PHP 文件
+  decision     String    @default("PENDING") /// MIGRATE / ARCHIVE_READONLY / DROP
+  signedBy     String?   @map("signed_by")
+  signedAt     DateTime? @map("signed_at")
+  note         String?
+
+  @@unique([reportKey])
+  @@map("long_tail_report")
+}

@@ -1,0 +1,24 @@
+# ============================================================
+# 生产三容器占位（阶段1 落地）：portal / server / worker 同机 4C8G 起步
+# 依据 plans/05 §3.1：RDS PG16 与 Redis 为云上外置资源，不在 compose 内；
+# 镜像来自云效流水线③（ACR），compose 只负责拉起与滚动。
+# ============================================================
+services:
+  portal:
+    image: ${REGISTRY:?REGISTRY required}/pte-portal:${TAG:-latest}
+    restart: always
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  server:
+    image: ${REGISTRY:?REGISTRY required}/pte-server:${TAG:-latest}
+    restart: always
+    env_file: .env
+    ports:
+      - "127.0.0.1:4000:4000"
+
+  worker:
+    image: ${REGISTRY:?REGISTRY required}/pte-server:${TAG:-latest}
+    restart: always
+    command: ["node", "apps/worker/dist/main.js"]
+    env_file: .env
