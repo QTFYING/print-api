@@ -262,20 +262,22 @@ enum SqlKind {
 
 /// 取代 expo_show（show001 编号 / show002 名称；展馆横排列 show008~show017_10 下沉到 ShowHall）
 model Show {
-  id           String    @id @default(uuid(7))
-  code         String    @unique /// show001 届次编号（如 2027），合同编号前缀
-  nameCn       String    @map("name_cn") /// show002
-  nameEn       String?   @map("name_en")
-  startOn      DateTime? @map("start_on") @db.Date
-  endOn        DateTime? @map("end_on") @db.Date
-  venueName    String?   @map("venue_name")
-  venueAddress String?   @map("venue_address")
-  isCurrent    Boolean   @default(false) @map("is_current") /// 登录默认选届
-  remarks      String? /// add_remarks
-  distribution Json?     @db.JsonB /// distribution 派位配置（语义存疑原样保）
-  legacyExtra  Json?     @map("legacy_extra") @db.JsonB
-  createdAt    DateTime  @default(now()) @map("created_at")
-  updatedAt    DateTime  @updatedAt @map("updated_at")
+  id            String    @id @default(uuid(7))
+  code          String    @unique /// show001 届次编号（如 2027），合同编号前缀
+  nameCn        String    @map("name_cn") /// show002
+  nameEn        String?   @map("name_en")
+  nameCnAbbr    String?   @map("name_cn_abbr") /// show004 中文简称（如「第六届广东大印展」），门户展示用
+  masterPlanUrl String?   @map("master_plan_url") /// all_pic 总展馆规划图（迁 OSS 私有桶后为 objectKey）
+  startOn       DateTime? @map("start_on") @db.Date
+  endOn         DateTime? @map("end_on") @db.Date
+  venueName     String?   @map("venue_name")
+  venueAddress  String?   @map("venue_address")
+  isCurrent     Boolean   @default(false) @map("is_current") /// 登录默认选届
+  remarks       String? /// add_remarks
+  distribution  Json?     @db.JsonB /// distribution 派位配置（语义存疑原样保）
+  legacyExtra   Json?     @map("legacy_extra") @db.JsonB
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
 
   halls          ShowHall[]
   bankAccounts   BankAccount[]
@@ -288,11 +290,10 @@ model Show {
   visitHistories VisitorVisitHistory[]
   snapshots      ExhibitorVariant[]
 
-  @@map("show")
-
   // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
   @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
   @@index([distribution(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@map("show")
 }
 
 /// 取代 show008~show017_10 横排列 + expo_exhibits_partition（展馆分区）
@@ -300,11 +301,13 @@ model ShowHall {
   id           String  @id @default(uuid(7))
   showId       String  @map("show_id")
   show         Show    @relation(fields: [showId], references: [id])
-  hallNo       String  @map("hall_no") /// 展馆号（A/B/C…）
+  hallNo       String? @map("hall_no") /// 解析出的馆号（如 1号馆 / 4号A馆）；同一馆可有一层/二层/连廊多条分区
   nameCn       String  @map("name_cn")
   nameEn       String? @map("name_en")
   priceZone    String? @map("price_zone") /// JGQY 价区 A/B/C（2200/1700/1300）
   floorPlanUrl String? @map("floor_plan_url") /// show0XX_pic 展位图（迁 OSS 私有桶后为 objectKey）
+  areas        Json?   @db.JsonB /// 面积四件套原样保：_sq 总面积 / _sq_a / _sq_b / _sq_c（后三者语义待甲方确认，见 notes/07）
+  hallKey      String? @map("hall_key") /// 来源横排列名（show008 / show017_4…），保证可回溯到旧列
   remark       String? /// bz
   sortOrder    Int     @default(0) @map("sort_order") /// xuhao
   active       Boolean @default(true)
@@ -315,7 +318,7 @@ model ShowHall {
   orderItems  OrderItem[]
   dataScopes  DataScope[]
 
-  @@unique([showId, hallNo])
+  @@unique([showId, nameCn]) /// 同一届次内分区名唯一（一个馆可能有一层/二层/连廊多条）
   @@index([showId, sortOrder])
   @@map("show_hall")
 }
@@ -387,12 +390,12 @@ model Exhibitor {
   showId String @map("show_id")
   show   Show   @relation(fields: [showId], references: [id])
 
-  companyNameCn     String? @map("company_name_cn") /// exhibitors002 中文全称（空时自动取英文）
-  companyNameCnAbbr String? @map("company_name_cn_abbr") /// 002_1 中文简称
-  companyNameEn     String? @map("company_name_en") /// 003 英文全称
-  companyNameEnAbbr String? @map("company_name_en_abbr") /// 003_1 英文简称
-  searchPinYin      String? @map("search_pin_yin") /// 名录拼音检索列（B 档复合筛选用）
-  searchKeywords    String[]    @default([]) @map("search_keywords") /// 实测新增：旧表 keywords 列（3686/3693 行有值、2629 个不同值），B 档名录检索直接依赖，§B 文档未记录
+  companyNameCn     String?  @map("company_name_cn") /// exhibitors002 中文全称（空时自动取英文）
+  companyNameCnAbbr String?  @map("company_name_cn_abbr") /// 002_1 中文简称
+  companyNameEn     String?  @map("company_name_en") /// 003 英文全称
+  companyNameEnAbbr String?  @map("company_name_en_abbr") /// 003_1 英文简称
+  searchPinYin      String?  @map("search_pin_yin") /// 名录拼音检索列（B 档复合筛选用）
+  searchKeywords    String[] @default([]) @map("search_keywords") /// 实测新增：旧表 keywords 列（3686/3693 行有值、2629 个不同值），B 档名录检索直接依赖，§B 文档未记录
 
   provinceCode  String? @map("province_code") /// 004 存 PROVINCE_CODE
   cityCode      String? @map("city_code") /// bs_city 同名列
@@ -491,14 +494,13 @@ model Exhibitor {
   @@index([showId, companyNameCn])
   @@index([loginEmail])
   @@index([mobile])
-  @@map("exhibitor")
-
   // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
   @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
   @@index([companyNameCn(ops: raw("gin_trgm_ops"))], type: Gin)
   @@index([companyNameEn(ops: raw("gin_trgm_ops"))], type: Gin)
   @@index([searchPinYin(ops: raw("gin_trgm_ops"))], type: Gin)
   @@index([searchKeywords(ops: raw("array_ops"))], type: Gin, map: "exhibitor_search_keywords_gin")
+  @@map("exhibitor")
 }
 
 /// 取代静默状态位：每次跃迁记 actor/time/reason（§6.2）
@@ -563,10 +565,9 @@ model ExhibitorDues {
 
   @@unique([exhibitorId, periodCode])
   @@index([exhibitorId])
-  @@map("exhibitor_dues")
-
   // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
   @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@map("exhibitor_dues")
 }
 
 /// 取代 expo_exhibitors_connect（沟通记录）
@@ -622,10 +623,9 @@ model ExhibitorVariant {
 
   @@index([snapshotType, companyName])
   @@index([mergedIntoId])
-  @@map("exhibitor_variant")
-
   // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
   @@index([payload(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@map("exhibitor_variant")
 }
 
 // ==================== 3. 合同审批域 ====================
@@ -668,11 +668,10 @@ model Contract {
   @@unique([showId, contractNo])
   @@index([exhibitorId])
   @@index([showId, status])
-  @@map("contract")
-
   // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
   @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
   @@index([partyBSnapshot(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@map("contract")
 }
 
 /// 取代 expo_contract_type（0=定金协议→dj_path，1=合同→ht_path）
@@ -968,10 +967,9 @@ model ProductCategory {
   siteOrders      SiteOrder[]
 
   @@index([parentId, level])
-  @@map("product_category")
-
   // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
   @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@map("product_category")
 }
 
 /// 取代 expo_otb/ots（mb=收费项目模板，命名误导已按实际语义重建）
@@ -1019,10 +1017,9 @@ model OrderItem {
 
   @@index([showId, orderNo]) /// 旧 order_nums 编号生成改服务端序列，不再靠临时表中转
   @@index([exhibitorId])
-  @@map("order_item")
-
   // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
   @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@map("order_item")
 }
 
 /// 取代 expo_order_pay（op_order_statue N/Y → payStatus 枚举）
@@ -1065,10 +1062,9 @@ model SiteOrder {
   legacyExtra   Json?            @map("legacy_extra") @db.JsonB
 
   @@index([exhibitorId])
-  @@map("site_order")
-
   // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
   @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@map("site_order")
 }
 
 // ==================== 6. 观众域 ====================
@@ -1108,10 +1104,9 @@ model Visitor {
   @@index([mobile])
   @@index([email])
   @@index([memberId])
-  @@map("visitor")
-
   // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
   @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@map("visitor")
 }
 
 /// 取代 expo_visitor_online / expo_visit_online / wwz_visitor_register（合并统一数据）
@@ -1142,10 +1137,9 @@ model VisitorRegistration {
   @@unique([showId, visitorId])
   @@index([showId, status])
   @@index([flowbackStatus])
-  @@map("visitor_registration")
-
   // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
   @@index([data(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@map("visitor_registration")
 }
 
 /// 取代 expo_visit_b（观众×届次 回头客）
@@ -1176,10 +1170,9 @@ model VisitorContact {
   legacyExtra Json?   @map("legacy_extra") @db.JsonB
 
   @@index([visitorId])
-  @@map("visitor_contact")
-
   // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
   @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@map("visitor_contact")
 }
 
 /// 取代 expo_visit_r（联系记录）
@@ -1217,11 +1210,10 @@ model ProductItem {
 
   @@index([exhibitorId])
   @@index([nameCn])
-  @@map("product_item")
-
   // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
   @@index([legacyExtra(ops: raw("jsonb_path_ops"))], type: Gin)
   @@index([nameCn(ops: raw("gin_trgm_ops"))], type: Gin, map: "product_item_name_cn_trgm_gin")
+  @@map("product_item")
 }
 
 /// 取代 expo_data_hkxx（会刊信息）
@@ -1632,11 +1624,10 @@ model AuditLog {
   @@index([targetKind, targetId, occurredAt])
   @@index([actorId, occurredAt])
   @@index([occurredAt])
-  @@map("audit_log")
-
   // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
   @@index([after(ops: raw("jsonb_path_ops"))], type: Gin)
   @@index([payload(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@map("audit_log")
 }
 
 /// 取代 pte_category（无限级 + lang 分中英）
@@ -1875,12 +1866,11 @@ model ReportBaseline {
   updatedAt DateTime @updatedAt @map("updated_at")
 
   @@unique([reportKey, showId]) /// 同参数基线一行；多参数场景由 params 承载并走人工签认
-  @@map("report_baseline")
-
   // —— PG 原生索引（Prisma 可表达部分，随迁移生成；部分唯一索引见 prisma/sql）——
   @@index([expected(ops: raw("jsonb_path_ops"))], type: Gin)
   @@index([actual(ops: raw("jsonb_path_ops"))], type: Gin)
   @@index([diff(ops: raw("jsonb_path_ops"))], type: Gin)
+  @@map("report_baseline")
 }
 
 /// 长尾报表处置签认（投标版：逐张确认"迁移/只读归档"）
