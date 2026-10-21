@@ -49,6 +49,24 @@ const api = async (path, init = {}) => {
 
 const emails = [];
 try {
+  // 前置归零：不依赖上一轮 finally 是否跑完，否则「缺权限 → 403」会被脏授权污染
+  await pool.query(
+    `DELETE FROM role_permission WHERE role_id = (SELECT id FROM role WHERE code='STAFF')
+     AND permission_id = (SELECT id FROM permission WHERE code='probe.access')`,
+  );
+  const stale = (
+    await pool.query(`SELECT id FROM member WHERE email LIKE 'smoke-%@smoke.local'`)
+  ).rows.map((r) => r.id);
+  if (stale.length) {
+    for (const t of ['member_role', 'member_identity', 'staff_profile', 'audit_log']) {
+      const col = t === 'audit_log' ? 'actor_id' : 'member_id';
+      await pool.query(`DELETE FROM ${t} WHERE ${col} = ANY($1::text[])`, [stale]);
+    }
+    // legacy_account.member_id 是 text（Prisma 里未建关系），必须按 text 比
+    await pool.query(`DELETE FROM legacy_account WHERE member_id = ANY($1::text[])`, [stale]);
+    await pool.query(`DELETE FROM member WHERE id = ANY($1::text[])`, [stale]);
+  }
+
   // 自测账号 A：argon2id，角色 STAFF（无 probe.access）
   const idA = await pool.query(
     `INSERT INTO member (id, display_name, email, password_hash, hash_algorithm, must_change_password, status, created_at, updated_at)
@@ -140,12 +158,12 @@ try {
   // 按外键依赖倒序清理（Prisma 生成的是 RESTRICT 外键，顺序错就删不掉）
   const ids = (await pool.query(`SELECT id FROM member WHERE email = ANY($1::text[])`, [emails])).rows.map((r) => r.id);
   if (ids.length) {
-    await pool.query(`DELETE FROM member_role WHERE member_id = ANY($1::uuid[])`, [ids]);
-    await pool.query(`DELETE FROM member_identity WHERE member_id = ANY($1::uuid[])`, [ids]);
-    await pool.query(`DELETE FROM staff_profile WHERE member_id = ANY($1::uuid[])`, [ids]);
-    await pool.query(`DELETE FROM legacy_account WHERE member_id = ANY($1::uuid[])`, [ids]);
-    await pool.query(`DELETE FROM audit_log WHERE actor_id = ANY($1::uuid[])`, [ids]);
-    await pool.query(`DELETE FROM member WHERE id = ANY($1::uuid[])`, [ids]);
+    await pool.query(`DELETE FROM member_role WHERE member_id = ANY($1::text[])`, [ids]);
+    await pool.query(`DELETE FROM member_identity WHERE member_id = ANY($1::text[])`, [ids]);
+    await pool.query(`DELETE FROM staff_profile WHERE member_id = ANY($1::text[])`, [ids]);
+    await pool.query(`DELETE FROM legacy_account WHERE member_id = ANY($1::text[])`, [ids]);
+    await pool.query(`DELETE FROM audit_log WHERE actor_id = ANY($1::text[])`, [ids]);
+    await pool.query(`DELETE FROM member WHERE id = ANY($1::text[])`, [ids]);
   }
   await pool.query(
     `DELETE FROM role_permission WHERE role_id = (SELECT id FROM role WHERE code='STAFF')
